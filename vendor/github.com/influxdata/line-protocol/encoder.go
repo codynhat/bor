@@ -6,7 +6,14 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"time"
 )
+
+// ErrIsNaN is a field error for when a float field is NaN.
+var ErrIsNaN = &FieldError{"is NaN"}
+
+// ErrIsInf is a field error for when a float field is Inf.
+var ErrIsInf = &FieldError{"is Inf"}
 
 // Encoder marshals Metrics into influxdb line protocol.
 // It is not safe for concurrent use, make a new one!
@@ -22,6 +29,7 @@ type Encoder struct {
 	header           []byte
 	footer           []byte
 	pair             []byte
+	precision        time.Duration
 }
 
 // SetMaxLineBytes sets a maximum length for a line, Encode will error if the generated line is longer
@@ -48,6 +56,12 @@ func (e *Encoder) FailOnFieldErr(s bool) {
 	e.failOnFieldError = s
 }
 
+// SetPrecision sets time precision for writes
+// Default is nanoseconds precision
+func (e *Encoder) SetPrecision(p time.Duration) {
+	e.precision = p
+}
+
 // NewEncoder gives us an encoder that marshals to a writer in influxdb line protocol
 // as defined by:
 // https://docs.influxdata.com/influxdb/v1.5/write_protocols/line_protocol_reference/
@@ -58,6 +72,7 @@ func NewEncoder(w io.Writer) *Encoder {
 		footer:    make([]byte, 0, 128),
 		pair:      make([]byte, 0, 128),
 		fieldList: make([]*Field, 0, 16),
+		precision: time.Nanosecond,
 	}
 }
 
@@ -72,9 +87,9 @@ func (e *Encoder) Encode(m Metric) (int, error) {
 		return 0, err
 	}
 
-	e.buildFooter(m)
+	e.buildFooter(m.Time())
 
-	// here we make a copy of the fields so we can do an in-place sort
+	// here we make a copy of the *fields so we can do an in-place sort
 	e.fieldList = append(e.fieldList[:0], m.FieldList()...)
 
 	if e.fieldSortOrder == SortFields {
@@ -112,6 +127,7 @@ func (e *Encoder) Encode(m Metric) (int, error) {
 			if err != nil {
 				return 0, err
 			}
+			pairsLen = 0
 			totalWritten += i
 
 			bytesNeeded = len(e.header) + len(e.pair) + len(e.footer)
@@ -153,7 +169,11 @@ func (e *Encoder) Encode(m Metric) (int, error) {
 
 		}
 
-		e.w.Write(e.pair)
+		i, err = e.w.Write(e.pair)
+		if err != nil {
+			return 0, err
+		}
+		totalWritten += i
 
 		pairsLen += len(e.pair)
 		firstField = false
@@ -199,16 +219,7 @@ func (e *Encoder) buildHeader(m Metric) error {
 	return nil
 }
 
-func (e *Encoder) buildFieldPair(key string, value interface{}) error {
-	e.pair = e.pair[:0]
-	key = escape(key)
-	// Some keys are not encodeable as line protocol, such as those with a
-	// trailing '\' or empty strings.
-	if key == "" {
-		return &FieldError{"invalid field key"}
-	}
-	e.pair = append(e.pair, key...)
-	e.pair = append(e.pair, '=')
+func (e *Encoder) buildFieldVal(value interface{}) error {
 	switch v := value.(type) {
 	case uint64:
 		if e.fieldTypeSupport&UintSupport != 0 {
@@ -224,22 +235,22 @@ func (e *Encoder) buildFieldPair(key string, value interface{}) error {
 		e.pair = append(strconv.AppendInt(e.pair, int64(v), 10), 'i')
 	case float64:
 		if math.IsNaN(v) {
-			return &FieldError{"is NaN"}
+			return ErrIsNaN
 		}
 
 		if math.IsInf(v, 0) {
-			return &FieldError{"is Inf"}
+			return ErrIsInf
 		}
 
 		e.pair = strconv.AppendFloat(e.pair, v, 'f', -1, 64)
 	case float32:
 		v32 := float64(v)
 		if math.IsNaN(v32) {
-			return &FieldError{"is NaN"}
+			return ErrIsNaN
 		}
 
 		if math.IsInf(v32, 0) {
-			return &FieldError{"is Inf"}
+			return ErrIsInf
 		}
 
 		e.pair = strconv.AppendFloat(e.pair, v32, 'f', -1, 64)
@@ -247,6 +258,10 @@ func (e *Encoder) buildFieldPair(key string, value interface{}) error {
 	case string:
 		e.pair = append(e.pair, '"')
 		e.pair = append(e.pair, stringFieldEscape(v)...)
+		e.pair = append(e.pair, '"')
+	case []byte:
+		e.pair = append(e.pair, '"')
+		stringFieldEscapeBytes(&e.pair, v)
 		e.pair = append(e.pair, '"')
 	case bool:
 		e.pair = strconv.AppendBool(e.pair, v)
@@ -256,9 +271,33 @@ func (e *Encoder) buildFieldPair(key string, value interface{}) error {
 	return nil
 }
 
-func (e *Encoder) buildFooter(m Metric) {
+func (e *Encoder) buildFieldPair(key string, value interface{}) error {
+	e.pair = e.pair[:0]
+	key = escape(key)
+	// Some keys are not encodeable as line protocol, such as those with a
+	// trailing '\' or empty strings.
+	if key == "" || key[:len(key)-1] == "\\" {
+		return &FieldError{"invalid field key"}
+	}
+	e.pair = append(e.pair, key...)
+	e.pair = append(e.pair, '=')
+	return e.buildFieldVal(value)
+}
+
+func (e *Encoder) buildFooter(t time.Time) {
 	e.footer = e.footer[:0]
-	e.footer = append(e.footer, ' ')
-	e.footer = strconv.AppendInt(e.footer, m.Time().UnixNano(), 10)
+	if !t.IsZero() {
+		e.footer = append(e.footer, ' ')
+		switch e.precision {
+		case time.Microsecond:
+			e.footer = strconv.AppendInt(e.footer, t.UnixNano()/1000, 10)
+		case time.Millisecond:
+			e.footer = strconv.AppendInt(e.footer, t.UnixNano()/1000000, 10)
+		case time.Second:
+			e.footer = strconv.AppendInt(e.footer, t.Unix(), 10)
+		default:
+			e.footer = strconv.AppendInt(e.footer, t.UnixNano(), 10)
+		}
+	}
 	e.footer = append(e.footer, '\n')
 }
